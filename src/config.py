@@ -45,6 +45,99 @@ SUPPORTED_LLM_CHANNEL_PROTOCOLS = ("openai", "anthropic", "gemini", "vertex_ai",
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
 
 
+def _parse_stock_codes_from_env(raw: str) -> List[str]:
+    """
+    从 STOCK_LIST 环境变量中提取股票代码列表。
+    支持三种格式，自动识别，大小写不敏感键名。
+
+    格式A（纯代码）：   002403
+                        002403,600519,000858
+    格式B（代码:买入价）：002403:11.398
+                          002403:11.398,600519:1820.00
+    格式C（完整JSON）：  [{"code":"002403","buy_price":11.398,"shares":600}]
+                         {"code":"002403","buy_price":11.398}  ← 单个对象也支持
+
+    返回：纯股票代码列表，如 ["002403", "600519"]
+    关键保障：若检测为JSON格式但解析失败，返回空列表而不是把JSON碎片当代码。
+    """
+    raw = (raw or "").strip().lstrip("\ufeff")
+    if not raw:
+        return []
+
+    # ── 格式C：JSON（以 [ 或 { 开头）────────────────────────
+    if raw.startswith(("[", "{")):
+        # 标准化处理：弯引号→直引号、全角标点→半角、尾随逗号
+        cleaned = raw
+        for old, new in [
+            ("\u201c", '"'), ("\u201d", '"'),   # 中文双引号
+            ("\u2018", "'"), ("\u2019", "'"),   # 中文单引号
+            ("\uff1a", ":"), ("\uff0c", ","),   # 全角冒号/逗号
+            ("\uff5b", "{"), ("\uff5d", "}"),   # 全角花括号
+            ("\uff3b", "["), ("\uff3d", "]"),   # 全角方括号
+        ]:
+            cleaned = cleaned.replace(old, new)
+        cleaned = re.sub(r",\s*}", "}", cleaned)
+        cleaned = re.sub(r",\s*]", "]", cleaned)
+        # 单引号包裹的键/值 → 双引号
+        cleaned = re.sub(r"(?<![\\])'([^']*)'", r'"\1"', cleaned)
+
+        for candidate in [raw, cleaned]:
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict):
+                    data = [data]
+                if isinstance(data, list):
+                    codes = []
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        # 大小写不敏感键名匹配
+                        lower = {k.lower(): v for k, v in item.items()}
+                        code_raw = (
+                            lower.get("code")
+                            or lower.get("股票代码")
+                            or lower.get("symbol")
+                            or lower.get("ticker")
+                        )
+                        if code_raw:
+                            codes.append(str(code_raw).strip().upper())
+                    if codes:
+                        logger.info("[STOCK_LIST] 格式C(JSON)解析成功：%s", codes)
+                        return codes
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # JSON格式检测成立但解析失败 → 禁止降级为逗号拆分（防止碎片当代码）
+        logger.error(
+            "[STOCK_LIST] ❌ JSON格式检测成立但解析失败！原始值: %s\n"
+            "  建议改用格式B（最稳定）：002403:11.398\n"
+            "  或标准JSON：[{\"code\":\"002403\",\"buy_price\":11.398}]",
+            raw[:200],
+        )
+        return []
+
+    # ── 格式A / 格式B：逗号或换行分隔 ───────────────────────
+    parts = [p.strip() for p in re.split(r"[,\n\r\t]+", raw) if p.strip()]
+    codes = []
+    for part in parts:
+        # 含JSON特殊字符的碎片直接跳过（防御性）
+        if any(c in part for c in ("{", "}", "[", "]", '"', "'")):
+            logger.warning("[STOCK_LIST] 跳过疑似JSON碎片：%s", part)
+            continue
+        if ":" in part:
+            # 格式B：取冒号前面的代码部分，忽略买入价
+            code = part.split(":", 1)[0].strip().upper()
+        else:
+            # 格式A：整体就是代码
+            code = part.strip().upper()
+        if code:
+            codes.append(code)
+
+    if codes:
+        logger.info("[STOCK_LIST] 格式A/B解析成功：%s", codes)
+    return codes
+
+
 def parse_env_bool(value: Optional[str], default: bool = False) -> bool:
     """Parse common truthy/falsey environment-style values."""
     if value is None:
@@ -669,14 +762,13 @@ class Config:
                 os.environ['https_proxy'] = https_proxy
 
         
-        # 解析自选股列表（逗号分隔，统一为大写 Issue #355）
+        # 解析自选股列表 —— 支持三种格式（Issue #355 升级版）
+        # 格式A（纯代码）：002403,600519
+        # 格式B（代码:买入价）：002403:11.398,600519:1820.00
+        # 格式C（完整JSON）：[{"code":"002403","buy_price":11.398,"shares":600}]
         stock_list_str = os.getenv('STOCK_LIST', '')
-        stock_list = [
-            (c or "").strip().upper()
-            for c in stock_list_str.split(',')
-            if (c or "").strip()
-        ]
-        
+        stock_list = _parse_stock_codes_from_env(stock_list_str)
+
         # 如果没有配置，使用默认的示例股票
         if not stock_list:
             stock_list = ['600519', '000001', '300750']
