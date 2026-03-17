@@ -60,6 +60,9 @@ def _parse_stock_codes_from_env(raw: str) -> List[str]:
     返回：纯股票代码列表，如 ["002403", "600519"]
     关键保障：若检测为JSON格式但解析失败，返回空列表而不是把JSON碎片当代码。
     """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     raw = (raw or "").strip().lstrip("\ufeff")
     if not raw:
         return []
@@ -92,23 +95,23 @@ def _parse_stock_codes_from_env(raw: str) -> List[str]:
                         if not isinstance(item, dict):
                             continue
                         # 大小写不敏感键名匹配
-                        lower = {k.lower(): v for k, v in item.items()}
+                        lower_item = {k.lower(): v for k, v in item.items()}
                         code_raw = (
-                            lower.get("code")
-                            or lower.get("股票代码")
-                            or lower.get("symbol")
-                            or lower.get("ticker")
+                            lower_item.get("code")
+                            or lower_item.get("股票代码")
+                            or lower_item.get("symbol")
+                            or lower_item.get("ticker")
                         )
                         if code_raw:
                             codes.append(str(code_raw).strip().upper())
                     if codes:
-                        logger.info("[STOCK_LIST] 格式C(JSON)解析成功：%s", codes)
+                        _log.info("[STOCK_LIST] 格式C(JSON)解析成功：%s", codes)
                         return codes
             except (json.JSONDecodeError, ValueError):
                 pass
 
         # JSON格式检测成立但解析失败 → 禁止降级为逗号拆分（防止碎片当代码）
-        logger.error(
+        _log.error(
             "[STOCK_LIST] ❌ JSON格式检测成立但解析失败！原始值: %s\n"
             "  建议改用格式B（最稳定）：002403:11.398\n"
             "  或标准JSON：[{\"code\":\"002403\",\"buy_price\":11.398}]",
@@ -122,7 +125,7 @@ def _parse_stock_codes_from_env(raw: str) -> List[str]:
     for part in parts:
         # 含JSON特殊字符的碎片直接跳过（防御性）
         if any(c in part for c in ("{", "}", "[", "]", '"', "'")):
-            logger.warning("[STOCK_LIST] 跳过疑似JSON碎片：%s", part)
+            _log.warning("[STOCK_LIST] 跳过疑似JSON碎片：%s", part)
             continue
         if ":" in part:
             # 格式B：取冒号前面的代码部分，忽略买入价
@@ -134,7 +137,7 @@ def _parse_stock_codes_from_env(raw: str) -> List[str]:
             codes.append(code)
 
     if codes:
-        logger.info("[STOCK_LIST] 格式A/B解析成功：%s", codes)
+        _log.info("[STOCK_LIST] 格式A/B解析成功：%s", codes)
     return codes
 
 
