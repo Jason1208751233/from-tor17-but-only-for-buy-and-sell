@@ -89,76 +89,286 @@ FALLBACK_STOCKS: List[Dict[str, Any]] = [
 ]
 
 
+def _normalize_json_string(s: str) -> str:
+    """
+    对 JSON 字符串做多重标准化，修复 GitHub Variables 所有常见编码问题。
+
+    修复清单：
+      1.  去除 BOM 和首尾空白
+      2.  中文弯引号 \u201c \u201d  →  ASCII 双引号 "
+      3.  中文单引号 \u2018 \u2019  →  ASCII 单引号 '
+      4.  欧式引号  \u201e \u201f \u2039 \u203a  → 对应直引号
+      5.  全角冒号 ／逗号  →  半角 : ,
+      6.  全角方括号 【】 ／花括号 ｛｝ ／ ［］  →  半角
+      7.  单引号包裹的 JSON 键/值 'key' → "key"
+      8.  尾随逗号 ,} 和 ,]  →  } ]（标准 JSON 不允许尾随逗号）
+    """
+    s = s.strip().lstrip("\ufeff")                            # 1. 去 BOM
+    # 2. 弯引号 / 弯单引号 → 直引号
+    s = s.replace("\u201c", '"').replace("\u201d", '"')
+    s = s.replace("\u2018", "'").replace("\u2019", "'")
+    # 4. 欧式引号
+    s = s.replace("\u201e", '"').replace("\u201f", '"')
+    s = s.replace("\u2039", "'").replace("\u203a", "'")
+    # 5. 全角标点 → 半角
+    s = s.replace("\uff1a", ":").replace("\uff0c", ",")
+    s = s.replace("\uff1b", ";")
+    # 6. 全角括号
+    s = s.replace("\u3010", "[").replace("\u3011", "]")
+    s = s.replace("\uff5b", "{").replace("\uff5d", "}")
+    s = s.replace("\uff3b", "[").replace("\uff3d", "]")
+    # 7. 单引号包裹的键/值 → 双引号
+    s = re.sub(r"(?<![\\])'([^']*)'", r'"\1"', s)
+    # 8. 尾随逗号（人手输入常见笔误）
+    s = re.sub(r",\s*}", "}", s)
+    s = re.sub(r",\s*]", "]", s)
+    return s
+
+
+def _extract_one_item(item: dict) -> Optional[Dict[str, Any]]:
+    """
+    从一个 JSON 对象中提取持仓字段。
+    完全大小写不敏感：code / CODE / Code / 股票代码 均可识别。
+    完全字段名容错：buy_price / buyPrice / BUY_PRICE / price / 成本价 均可识别。
+    """
+    if not isinstance(item, dict):
+        return None
+
+    # 构建全小写键映射（保留原值）
+    lower_map: Dict[str, Any] = {k.lower(): v for k, v in item.items()}
+
+    # ── 股票代码（必填，找不到则跳过）──────────────────────────────
+    code_raw = (
+        lower_map.get("code")
+        or lower_map.get("股票代码")
+        or lower_map.get("symbol")
+        or lower_map.get("ticker")
+        or lower_map.get("id")
+    )
+    if not code_raw:
+        logger.warning("[STOCK_LIST] JSON条目缺少code字段，已跳过。条目内容: %s", item)
+        return None
+    code = str(code_raw).strip().lstrip("'\"")
+
+    # ── 买入价（可选）────────────────────────────────────────────────
+    buy_price_raw = (
+        lower_map.get("buy_price")
+        or lower_map.get("buyprice")
+        or lower_map.get("price")
+        or lower_map.get("cost")
+        or lower_map.get("成本价")
+        or lower_map.get("买入价")
+        or lower_map.get("cost_price")
+    )
+    buy_price: Optional[float] = None
+    if buy_price_raw is not None:
+        try:
+            buy_price = float(buy_price_raw)
+        except (ValueError, TypeError):
+            logger.warning("[STOCK_LIST] %s 的 buy_price 无法转为数字：%s，已置为空", code, buy_price_raw)
+
+    # ── 持仓股数（可选）──────────────────────────────────────────────
+    shares_raw = (
+        lower_map.get("shares")
+        or lower_map.get("volume")
+        or lower_map.get("qty")
+        or lower_map.get("quantity")
+        or lower_map.get("持仓股数")
+        or lower_map.get("股数")
+    )
+    shares: Optional[int] = None
+    if shares_raw is not None:
+        try:
+            shares = int(float(shares_raw))
+        except (ValueError, TypeError):
+            pass
+
+    return {
+        "code": code,
+        "buy_price": buy_price,
+        "shares": shares,
+        "buy_date": lower_map.get("buy_date") or lower_map.get("date") or lower_map.get("买入日期"),
+        "notes": str(lower_map.get("notes") or lower_map.get("note") or lower_map.get("备注") or ""),
+        "name": str(lower_map.get("name") or lower_map.get("股票名称") or ""),
+    }
+
+
+def _try_parse_json(raw: str) -> Optional[List[Dict[str, Any]]]:
+    """
+    尝试用多种策略解析 JSON 字符串。
+    成功返回条目列表，失败返回 None（不抛异常）。
+
+    策略顺序：
+      1. 直接 json.loads（最优先，处理标准 JSON）
+      2. 标准化后 json.loads（处理弯引号/全角字符）
+      3. repair_json 修复后 json.loads（处理尾逗号/缺引号等）
+    """
+    candidates = [raw, _normalize_json_string(raw)]
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            # 允许单个对象 {} 直接包裹（不强制要求 []）
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            if isinstance(parsed, list):
+                result = [_extract_one_item(it) for it in parsed]
+                result = [r for r in result if r is not None]
+                if result:
+                    return result
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 最后用 repair_json 兜底
+    try:
+        fixed = repair_json(_normalize_json_string(raw))
+        parsed = json.loads(fixed)
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if isinstance(parsed, list):
+            result = [_extract_one_item(it) for it in parsed]
+            result = [r for r in result if r is not None]
+            if result:
+                logger.info("[STOCK_LIST] JSON经 repair_json 修复后解析成功")
+                return result
+    except Exception:
+        pass
+
+    return None
+
+
+def _looks_like_json(s: str) -> bool:
+    """判断字符串是否像 JSON（含花括号或方括号）。"""
+    stripped = s.strip().lstrip("\ufeff")
+    return stripped.startswith(("[", "{", "【", "｛", "\u201c["))
+
+
 def _parse_stock_list_env(raw: str) -> List[Dict[str, Any]]:
     """
-    解析 STOCK_LIST 环境变量。支持格式A/B/C自动识别。
-    返回：[{"code": "002403", "buy_price": 8.50, ...}, ...]
+    解析 STOCK_LIST 环境变量。自动识别三种格式，极度容错。
+
+    ─────────────────────────────────────────────────────────────
+    格式A（纯代码）：  002403
+                       002403,600519,000858
+    格式B（代码:价格）：002403:11.398
+                        002403:11.398,600519:1820.00
+    格式C（完整JSON）：[{"code":"002403","buy_price":11.398,"shares":600}]
+                        大小写不敏感，支持中英文键名，支持单对象{}不带[]
+    ─────────────────────────────────────────────────────────────
+
+    【关键安全保障】：
+    若字符串被判定为 JSON（含{}或[]）但解析失败，
+    绝对不会降级用逗号拆分（否则会把 JSON 碎片当成股票代码）。
+    而是记录详细错误日志并返回空列表，触发 FALLBACK_STOCKS 兜底。
     """
-    raw = raw.strip()
+    raw = raw.strip().lstrip("\ufeff")
     if not raw:
         return []
 
-    # 格式C：JSON 数组
-    if raw.startswith("["):
-        try:
-            items = json.loads(raw)
-            result = []
-            for item in items:
-                if isinstance(item, dict) and item.get("code"):
-                    result.append(
-                        {
-                            "code": str(item["code"]).strip(),
-                            "buy_price": float(item["buy_price"]) if item.get("buy_price") else None,
-                            "shares": int(item["shares"]) if item.get("shares") else None,
-                            "buy_date": item.get("buy_date"),
-                            "notes": item.get("notes", ""),
-                            "name": item.get("name", ""),
-                        }
-                    )
-            logger.info("[STOCK_LIST] 解析格式C(JSON)：%d 只持仓", len(result))
-            return result
-        except (json.JSONDecodeError, ValueError) as exc:
-            logger.warning("[STOCK_LIST] JSON解析失败，降级尝试A/B格式: %s", exc)
+    logger.info("[STOCK_LIST] 原始值（前200字符）: %s", raw[:200])
 
-    # 格式A / 格式B：逗号或换行分隔
-    parts = [p.strip() for p in re.split(r"[,\n\r]+", raw) if p.strip()]
-    result = []
+    # ── 判断是否像 JSON ──────────────────────────────────────────
+    if _looks_like_json(raw):
+        result = _try_parse_json(raw)
+        if result:
+            logger.info(
+                "[STOCK_LIST] ✅ 格式C(JSON)解析成功：%d 只持仓 → %s",
+                len(result),
+                [r["code"] for r in result],
+            )
+            return result
+
+        # JSON 检测成立但解析全部失败 → 记录详细错误，禁止降级拆分
+        logger.error(
+            "[STOCK_LIST] ❌ JSON格式检测成立但解析失败！\n"
+            "  原始值: %s\n"
+            "  常见原因：\n"
+            "    1. 键名使用大写但格式不标准（请检查：code/CODE/buy_price/BUY_PRICE均支持）\n"
+            "    2. 使用了中文弯引号 " " 而非英文直引号 \" \"（本版本已自动修复，若仍失败请检查）\n"
+            "    3. JSON 结构不完整（缺少花括号或方括号）\n"
+            "    4. GitHub Variables 对特殊字符做了转义\n"
+            "  建议改用格式B避免以上问题：002403:11.398",
+            raw[:300],
+        )
+        logger.error(
+            "[STOCK_LIST] ⛔ 已检测到JSON格式，拒绝降级为逗号拆分（防止把JSON碎片当股票代码）"
+        )
+        return []
+
+    # ── 格式A / 格式B：逗号或换行分隔 ───────────────────────────
+    parts = [p.strip() for p in re.split(r"[,\n\r\t]+", raw) if p.strip()]
+    result: List[Dict[str, Any]] = []
     for part in parts:
+        # 跳过明显不是股票代码的碎片（包含花括号/引号说明是JSON碎片）
+        if any(c in part for c in ("{", "}", "[", "]", '"', "'")):
+            logger.warning("[STOCK_LIST] 跳过疑似JSON碎片（请改用完整JSON格式）：%s", part)
+            continue
         if ":" in part:
             segs = part.split(":", 1)
             code = segs[0].strip()
             try:
-                buy_price = float(segs[1].strip())
+                buy_price: Optional[float] = float(segs[1].strip())
             except (ValueError, IndexError):
                 buy_price = None
-            result.append({"code": code, "buy_price": buy_price, "shares": None, "notes": ""})
+            result.append({"code": code, "buy_price": buy_price, "shares": None, "notes": "", "name": ""})
         else:
-            result.append({"code": part.strip(), "buy_price": None, "shares": None, "notes": ""})
-    logger.info("[STOCK_LIST] 解析格式A/B：%d 只持仓", len(result))
+            code = part.strip()
+            if code:
+                result.append({"code": code, "buy_price": None, "shares": None, "notes": "", "name": ""})
+
+    logger.info(
+        "[STOCK_LIST] ✅ 格式A/B解析成功：%d 只持仓 → %s",
+        len(result),
+        [r["code"] for r in result],
+    )
     return result
 
 
 def _load_held_stocks() -> Dict[str, Dict[str, Any]]:
-    """从 STOCK_LIST 环境变量加载持仓，找不到时使用 FALLBACK_STOCKS。"""
+    """
+    从 STOCK_LIST 环境变量加载持仓配置。
+    解析失败或变量为空时自动使用 FALLBACK_STOCKS 兜底，不崩溃不报错。
+    """
     raw = os.environ.get("STOCK_LIST", "").strip()
+
     if raw:
         parsed = _parse_stock_list_env(raw)
         if parsed:
             stocks: Dict[str, Dict[str, Any]] = {}
             for item in parsed:
                 code = item["code"]
+                # 股票名称：JSON中填写的 > 静态映射表
                 name = item.get("name") or STOCK_NAME_MAP.get(code, "")
                 stocks[code] = {
                     "name": name,
                     "buy_price": item.get("buy_price"),
                     "shares": item.get("shares"),
                     "buy_date": item.get("buy_date"),
-                    "notes": item.get("notes", "来自STOCK_LIST"),
+                    "notes": item.get("notes") or "来自STOCK_LIST",
                 }
-            logger.info("[STOCK_LIST] 已加载 %d 只持仓：%s", len(stocks), list(stocks.keys()))
+            logger.info(
+                "[STOCK_LIST] 最终持仓列表：%s",
+                {
+                    c: f"买入价={v.get('buy_price')} 股数={v.get('shares')}"
+                    for c, v in stocks.items()
+                },
+            )
             return stocks
 
-    logger.warning("[STOCK_LIST] 环境变量未配置，使用 FALLBACK_STOCKS 兜底")
+        # parsed 为空（JSON解析失败或格式A/B无有效条目）
+        logger.warning(
+            "[STOCK_LIST] 解析结果为空，使用 FALLBACK_STOCKS 兜底。\n"
+            "  请检查 GitHub Variables 中 STOCK_LIST 的值格式是否正确。\n"
+            "  推荐格式B（最简单）：002403:11.398\n"
+            "  完整JSON格式C示例：[{\"code\":\"002403\",\"buy_price\":11.398,\"shares\":600,\"notes\":\"爱仕达\"}]"
+        )
+    else:
+        logger.warning(
+            "[STOCK_LIST] 环境变量 STOCK_LIST 未配置或为空，使用 FALLBACK_STOCKS 兜底。\n"
+            "  配置路径：GitHub仓库 → Settings → Secrets and variables → Actions → Variables → New variable\n"
+            "  Name: STOCK_LIST\n"
+            "  Value（推荐格式B）：002403:11.398"
+        )
+
     return {
         item["code"]: {k: v for k, v in item.items() if k != "code"}
         for item in FALLBACK_STOCKS
